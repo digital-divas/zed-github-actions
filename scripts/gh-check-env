@@ -1,0 +1,103 @@
+#!/usr/bin/env ruby
+# Checks that every secrets.X / vars.X referenced by the workflows exists on GitHub, in the context of each job:
+# repository and organization, plus the job's environment (including environments built from matrix values).
+# Usage: gh-check-env [workflow files]    (run inside the repository; defaults to .github/workflows/*.y*ml)
+require 'yaml'
+require 'json'
+require 'open3'
+
+BUILTIN_SECRETS = %w[GITHUB_TOKEN].freeze
+
+def gh_api(path, jq)
+  out, _err, status = Open3.capture3('gh', 'api', '--paginate', path, '--jq', jq)
+  status.success? ? out.split("\n") : nil
+end
+
+REPO = Open3.capture2('gh', 'repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner').first.strip
+abort 'not inside a GitHub repository' if REPO.empty?
+
+def names(kind, scope)
+  @names ||= {}
+  @names[[kind, scope]] ||= begin
+    collection = kind == :secrets ? 'secrets' : 'variables'
+    path = case scope
+           when :repo then "repos/#{REPO}/actions/#{collection}?per_page=100"
+           when :org then "repos/#{REPO}/actions/organization-#{collection}?per_page=100"
+           else "repos/#{REPO}/environments/#{scope}/#{collection}?per_page=100"
+           end
+    gh_api(path, ".#{collection}[].name") || []
+  end
+end
+
+def environment_exists?(name)
+  @environments ||= gh_api("repos/#{REPO}/environments?per_page=100", '.environments[].name') || []
+  @environments.include?(name)
+end
+
+def references(node, kind)
+  prefix = kind == :secrets ? 'secrets' : 'vars'
+  text = node.to_yaml
+  text.scan(/\b#{prefix}\.([A-Za-z_][A-Za-z0-9_]*)/).flatten
+      .concat(text.scan(/\b#{prefix}\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\]/).flatten)
+      .uniq.sort
+end
+
+# Expands ${{ matrix.X }} in the environment name with every literal value of the job's matrix
+def environment_names(job)
+  env = job['environment']
+  env = env['name'] if env.is_a?(Hash)
+  return [nil] if env.nil?
+
+  env = env.to_s
+  matrix = (job.dig('strategy', 'matrix') || {})
+  matrix = {} unless matrix.is_a?(Hash)
+  keys = env.scan(/\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}/).flatten.uniq
+  combos = keys.reduce([{}]) do |acc, key|
+    values = matrix[key].is_a?(Array) ? matrix[key] : []
+    values += Array(matrix['include']).select { |inc| inc.is_a?(Hash) && inc.key?(key) }.map { |inc| inc[key] }
+    acc.product(values.uniq).map { |combo, value| combo.merge(key => value) }
+  end
+  combos.map do |combo|
+    combo.reduce(env) { |name, (key, value)| name.gsub(/\$\{\{\s*matrix\.#{Regexp.escape(key)}\s*\}\}/, value.to_s) }
+  end
+end
+
+files = ARGV.empty? ? Dir['.github/workflows/*.{yml,yaml}'].sort : ARGV
+problems = 0
+
+files.each do |file|
+  workflow = YAML.safe_load(File.read(file), aliases: true) || {}
+  shared = { 'env' => workflow['env'], 'defaults' => workflow['defaults'] }
+  (workflow['jobs'] || {}).each do |job_id, job|
+    next unless job.is_a?(Hash)
+
+    environment_names(job).each do |environment|
+      label = "#{File.basename(file)} › #{job_id}#{environment ? " (#{environment})" : ''}"
+      issues = []
+
+      if environment&.include?('${{')
+        issues << "cannot resolve environment #{environment}"
+      elsif environment && !environment_exists?(environment)
+        issues << "environment #{environment} does not exist"
+      else
+        scopes = [:repo, :org, environment].compact
+        { secrets: 'secret', vars: 'variable' }.each do |kind, noun|
+          available = scopes.flat_map { |scope| names(kind, scope) }
+          wanted = references(job, kind) | references(shared, kind)
+          wanted -= BUILTIN_SECRETS if kind == :secrets
+          (wanted - available).each { |name| issues << "missing #{noun}: #{name}" }
+        end
+      end
+
+      if issues.empty?
+        puts "ok      #{label}"
+      else
+        problems += issues.size
+        puts "FAIL    #{label}"
+        issues.each { |issue| puts "          #{issue}" }
+      end
+    end
+  end
+end
+
+exit(problems.zero? ? 0 : 1)
